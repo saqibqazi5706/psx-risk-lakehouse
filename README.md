@@ -103,7 +103,7 @@ psx-risk-lakehouse/
 
 ## Team
 
-- Saqib — _role_
-- _Teammate name_ — _role_
+- Saqib Qazi
+- Hassan Shakil Pasha
 
 Course: Data Visualization and Analysis — FAST-NUCES Lahore
