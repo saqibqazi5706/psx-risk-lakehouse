@@ -1,0 +1,34 @@
+# ---- Data (never commit full datasets) ----
+data/
+*.parquet
+*.delta
+_delta_log/
+*.zip
+# Keep only the small sample files
+!samples/
+!samples/**
+
+# ---- Jupyter / Python ----
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# ---- Secrets & local config ----
+.env
+*.env
+.databrickscfg
+secrets/
+
+# ---- Power BI temp / cache ----
+*.pbix.bak
+~$*
+
+# ---- OS / editor junk ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
