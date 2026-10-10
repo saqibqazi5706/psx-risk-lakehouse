@@ -253,7 +253,7 @@ ORDER BY start_time DESC;
 
 ## Proof of execution
 
-The proof notebooks are committed **with their outputs saved**:
+The proof notebooks below were run in Databricks and their outputs are saved in the workspace. (Databricks Git folders do not commit notebook outputs, so the code is in this repository and the results are shown in the workspace and the submission.)
 
 | Requirement | Where |
 |---|---|
@@ -299,7 +299,3 @@ The data contains **no personally identifiable information (PII)**: it is aggreg
 - [x] **Phase 2** — Bronze and Silver layers with full, incremental and backfill loads
 - [ ] **Phase 3** — Gold layer models and BI dashboard
 
----
-
-
-Course: Data Visualization and Analysis — FAST-NUCES Lahore
