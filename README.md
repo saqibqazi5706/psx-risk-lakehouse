@@ -1,8 +1,8 @@
 # PSX Risk Lakehouse
 
-An end-to-end data pipeline that ingests daily trading data from the **Pakistan Stock Exchange (PSX)**, processes it through a **Medallion Architecture** (Bronze → Silver → Gold) with **PySpark and Delta Lake on Databricks**, and will deliver volatility-based risk analytics through a Power BI dashboard.
+An end-to-end data pipeline that ingests daily trading data from the **Pakistan Stock Exchange (PSX)**, processes it through a **Medallion Architecture** (Bronze → Silver → Gold) with **PySpark and Delta Lake on Databricks**, and delivers volatility-based risk analytics through a Power BI dashboard.
 
-> **Status:** Phase 2 complete — Bronze and Silver layers with full, incremental and backfill loads, idempotent reruns, schema-drift quarantine and execution logging.
+> **Status:** Phase 3 complete — Gold star schema (2 dimensions, base + aggregated fact), end-to-end pipeline Raw → Bronze → Silver → Gold with logging at every layer, and a 3-page Power BI dashboard.
 
 ---
 
@@ -10,7 +10,7 @@ An end-to-end data pipeline that ingests daily trading data from the **Pakistan 
 
 Stock prices are hard to predict, but *risk* is not random: turbulent periods cluster together, and calm periods do too. This project turns raw PSX market data into a clean, analysis-ready view of **which stocks and sectors are in high-risk regimes, whether turbulence is market-wide or company-specific, and how volatility responds to monetary policy decisions.**
 
-### Business questions the dashboard will answer
+### Business questions the dashboard answers
 
 1. Which stocks and sectors are currently in a high-volatility regime?
 2. Is observed turbulence **systemic** (market-wide) or **idiosyncratic** (company-specific)?
@@ -21,12 +21,14 @@ Stock prices are hard to predict, but *risk* is not random: turbulent periods cl
 ## Architecture
 
 ```
- Source                   Bronze                        Silver                          Gold (Phase 3)
+ Source                   Bronze                        Silver                          Gold
 ┌────────────────┐   ┌──────────────────────────┐   ┌───────────────────────────┐   ┌──────────────────┐
-│ PSX daily       │──▶│ bronze.mkt_summary        │──▶│ silver.daily_prices        │──▶│ Volatility, risk │
-│ Market Summary  │   │ raw strings, 1 row/line,  │   │ typed, deduplicated,       │   │ tiers, sector &  │
-│ (.Z per day)    │   │ + file date, source,      │   │ validated, MERGE INTO on   │   │ event aggregates │
-└────────────────┘   │   batch_id, load_timestamp│   │ (symbol, trade_date)       │   └──────────────────┘
+│ PSX daily       │──▶│ bronze.mkt_summary        │──▶│ silver.daily_prices        │──▶│ star schema:     │
+│ Market Summary  │   │ raw strings, 1 row/line,  │   │ typed, deduplicated,       │   │ dim_date,        │
+│ (.Z per day)    │   │ + file date, source,      │   │ validated, MERGE INTO on   │   │ dim_stock, facts │
+└────────────────┘   │   batch_id, load_timestamp│   │ (symbol, trade_date)       │   └────────┬─────────┘
+                                                                                                      ▼
+                                                                                              Power BI (SQL Warehouse)
                      └────────────┬─────────────┘   └─────────────┬─────────────┘
                                   │ bad lines                      │ cast failures
                                   ▼                                ▼
@@ -42,7 +44,7 @@ Stock prices are hard to predict, but *risk* is not random: turbulent periods cl
 |-------|---------|----------------|
 | **Bronze** | Raw landing zone, faithful copy of the source | Explicit `StructType` (all strings, no `inferSchema`); lineage columns; one trading day is reloaded atomically with Delta `replaceWhere`; malformed lines quarantined |
 | **Silver** | Cleansed, conformed data | Type casting (DATE, DOUBLE, BIGINT); futures removed; de-duplication; validity flags; cast failures quarantined; `MERGE INTO` upsert |
-| **Gold** *(Phase 3)* | Analyst-ready models | Daily log returns, split/bonus adjustment, rolling volatility, risk tiers, beta vs KSE-100, sector aggregates, rate-decision event windows |
+| **Gold** | Star schema for analysis and BI | Log returns on PSX's split-adjusted LDCP, 20/60-day annualised volatility, daily risk percentile and tier, market-level aggregate, SBP policy rate per day; facts upserted with `MERGE INTO`, liquid clustering |
 
 ---
 
@@ -51,7 +53,8 @@ Stock prices are hard to predict, but *risk* is not random: turbulent periods cl
 | Source | Content | Used in |
 |--------|---------|---------|
 | PSX Daily Downloads — Market Summary (Closing): `https://dps.psx.com.pk/download/mkt_summary/{YYYY-MM-DD}.Z` | End-of-day OHLCV for every traded security, one file per trading day, 2015 → present | Bronze, Silver |
-| [SBP — Structure of Interest Rates](https://www.sbp.org.pk/assets/document/sir.pdf) | Policy rate decisions and effective dates | Gold *(Phase 3)* |
+| [SBP — Structure of Interest Rates](https://www.sbp.org.pk/assets/document/sir.pdf) | Policy rate decisions and effective dates | Gold (`ref_policy_rate` → `dim_date`) |
+| PSX Data Portal sector summary | Official sector names for codes 0801–0839 | Gold (`ref_sector` → `dim_stock`) |
 
 **File format.** Despite the `.Z` extension, files are GZIP (older years) or ZIP (newer years). Content is pipe-delimited, no header, Latin-1, 10 data fields followed by 3 empty fields, so a valid line has exactly **12 pipes**:
 
@@ -68,7 +71,7 @@ Databricks Free Edition has no outbound internet access to PSX, and PSX returns 
 
 - **New:** each trading day adds one file and one row per traded symbol. Incremental Silver runs pick up only dates newer than the last loaded date.
 - **Updated:** if PSX re-publishes a day, reloading that file replaces the day in Bronze, and Silver's `MERGE` updates only rows whose values changed (detected by a row hash), setting `updated_timestamp`.
-- **Deleted / delisted:** a delisted company simply stops appearing in new files. Its history stays in Silver; Gold will mark it inactive.
+- **Deleted / delisted:** a delisted company simply stops appearing in new files. Its history stays in Silver; Gold marks it `is_active = FALSE` in `dim_stock`.
 
 ---
 
@@ -119,14 +122,101 @@ Everything is stored as STRING on purpose: Bronze never rejects a value because 
 | load_timestamp | TIMESTAMP | When the row was first inserted (never changed by updates) |
 | updated_timestamp | TIMESTAMP | When the row was last updated; NULL if never |
 
-### `ops.pipeline_execution_logs` — one row per Bronze file or Silver run
+### Gold layer — star schema
+
+```
+            dim_date (+ SBP policy rate)
+             /                  \
+fact_daily_stock (base)    fact_market_daily (aggregated from base)
+            |
+        dim_stock (+ sector name, security type)
+```
+
+Scope: listed equities and funds only. Debt instruments (sector `36`, `3610`, NULL), preference shares (`…PS`) and futures (`…-`) are excluded.
+
+#### `gold.dim_date` — one row per calendar day, 2015–2027 (overwrite each run)
+
+**Primary key:** `date_key`
+
+| Column | Type | Description |
+|---|---|---|
+| date_key | INT | `yyyyMMdd`, e.g. 20250428 |
+| full_date | DATE | Calendar date |
+| year, quarter, month, week_of_year | INT | Calendar parts |
+| month_name, year_month, day_name | STRING | Labels for charts |
+| is_weekend | BOOLEAN | Saturday or Sunday |
+| is_trading_day | BOOLEAN | PSX published data that day |
+| policy_rate_pct | DOUBLE | SBP policy rate in force (carried forward from the last decision) |
+| rate_change_bps | INT | Change announced that day (0 otherwise) |
+| is_policy_decision_day | BOOLEAN | SBP decision took effect that day |
+| load_timestamp | TIMESTAMP | When the row was written |
+
+#### `gold.dim_stock` — one row per listed security (overwrite each run)
+
+**Primary key:** `stock_key`
+
+| Column | Type | Description |
+|---|---|---|
+| stock_key | BIGINT | `xxhash64(symbol)` — deterministic surrogate key |
+| symbol | STRING | Ticker (natural key) |
+| company_name | STRING | Latest name, `XD/XB` suffixes removed |
+| sector_code | STRING | Latest PSX sector code |
+| sector_name | STRING | From `ref_sector`; old pre-June-2015 codes → "Legacy sector" |
+| security_type | STRING | Equity / Closed-End Fund / ETF / REIT / Legacy |
+| first_trade_date, last_trade_date | DATE | First and last appearance |
+| trading_days | INT | Days the symbol appeared |
+| is_active | BOOLEAN | Seen in the last 30 days of data |
+| load_timestamp | TIMESTAMP | When the row was written |
+
+#### `gold.fact_daily_stock` — base fact, one stock on one trading day (MERGE)
+
+**Primary key:** `(date_key, stock_key)`  ·  **Foreign keys:** `date_key` → `dim_date`, `stock_key` → `dim_stock`  ·  `CLUSTER BY (date_key, stock_key)`
+
+| Column | Type | Description |
+|---|---|---|
+| date_key | INT | FK → dim_date |
+| stock_key | BIGINT | FK → dim_stock |
+| open, high, low, close, ldcp | DOUBLE | Prices (PKR) |
+| volume | BIGINT | Shares traded |
+| daily_return | DOUBLE | `ln(close / ldcp)` |
+| is_extreme_move | BOOLEAN | \|return\| > 15%; excluded from volatility |
+| vol_20d, vol_60d | DOUBLE | Std. dev. of last 20 / 60 valid returns × √252 (NULL if < 15 / 45 returns) |
+| avg_volume_20d | DOUBLE | 20-day average volume (liquidity) |
+| risk_percentile | DOUBLE | Rank of vol_20d among rated stocks that day (0–1) |
+| risk_tier | STRING | High (≥ 0.8) / Medium (≥ 0.4) / Low / Not Rated |
+| is_traded, is_ohlc_valid | BOOLEAN | Quality flags from Silver |
+| load_timestamp | TIMESTAMP | When the row was written |
+
+#### `gold.fact_market_daily` — aggregated fact, whole market on one trading day (MERGE)
+
+**Primary key / foreign key:** `date_key` → `dim_date`  ·  Built from `fact_daily_stock`  ·  `CLUSTER BY (date_key)`
+
+| Column | Type | Description |
+|---|---|---|
+| date_key | INT | FK → dim_date |
+| stocks_traded, advancers, decliners | INT | Market breadth |
+| total_volume | BIGINT | Shares traded in the market |
+| market_return | DOUBLE | Equal-weighted average daily return |
+| market_vol_20d | DOUBLE | 20-day volatility of the market return × √252 (systemic risk) |
+| median_stock_vol_20d | DOUBLE | Typical stock's volatility |
+| pct_high_risk | DOUBLE | Share of rated stocks in the High tier |
+| load_timestamp | TIMESTAMP | When the row was written |
+
+#### Reference tables (built from code in `03_gold/00_reference_data`)
+
+| Table | Content |
+|---|---|
+| `gold.ref_sector` | 38 PSX sector codes → official name and security type |
+| `gold.ref_policy_rate` | 40 SBP policy rate decisions (effective date, rate, change in bps, direction) |
+
+### `ops.pipeline_execution_logs` — one row per Bronze file, Silver run or Gold step
 
 | Column | Type | Description |
 |---|---|---|
 | batch_id | STRING | Run identifier |
-| layer | STRING | `raw_to_bronze` or `bronze_to_silver` |
+| layer | STRING | `raw_to_bronze`, `bronze_to_silver` or `silver_to_gold` |
 | load_type | STRING | `full`, `incremental` or `backfill` |
-| parameter | STRING | Source file path (Bronze) or date range `start..end` (Silver) |
+| parameter | STRING | Source file path (Bronze), date range (Silver) or Gold table + range |
 | start_time, end_time | TIMESTAMP | Run window |
 | duration_seconds | DOUBLE | `end_time - start_time` |
 | status | STRING | `SUCCESS` or `FAILURE` |
@@ -154,6 +244,7 @@ Everything is stored as STRING on purpose: Bronze never rejects a value because 
 
 - **Bronze:** each file is written with `mode("overwrite").option("replaceWhere", "file_trade_date = '<date>'")`. Reloading a day replaces exactly that day, never duplicates it.
 - **Silver:** rows are upserted with `MERGE INTO ... ON symbol AND trade_date`. Matched rows are updated **only if `row_hash` differs**, so rerunning the same range reports `0 inserted, 0 updated`.
+- **Gold:** dimensions are rebuilt with overwrite; facts are upserted with `MERGE INTO` on their grain. Re-running a backfill inserts 0 rows and only refreshes values.
 - **Quarantine:** before writing, each run deletes its own earlier quarantine rows for the same dates and layer, so reruns do not pile up duplicates.
 
 ### Schema drift
@@ -194,10 +285,20 @@ psx-risk-lakehouse/
     │   ├── bronze_functions       # load_to_bronze(), load_range()
     │   ├── 01_raw_to_bronze       # Runner with widgets
     │   └── 02_bronze_proofs       # Schema, rerun, drift, failure proofs (saved outputs)
-    └── 02_silver/
-        ├── silver_functions       # build_silver(), load_silver()
-        ├── 01_bronze_to_silver    # Runner with widgets
-        └── 02_silver_proofs       # Incremental, rerun, update, type-drift proofs (saved outputs)
+    ├── 02_silver/
+    │   ├── silver_functions       # build_silver(), load_silver()
+    │   ├── 01_bronze_to_silver    # Runner with widgets
+    │   └── 02_silver_proofs       # Incremental, rerun, update, type-drift proofs (saved outputs)
+    ├── 03_gold/
+    │   ├── 00_reference_data      # ref_sector, ref_policy_rate
+    │   ├── gold_functions         # build_dim_date/stock, build_fact_daily_stock/market_daily, load_gold()
+    │   └── 01_silver_to_gold      # Runner with widgets + OPTIMIZE + checks
+    └── 04_pipeline/
+        └── run_pipeline           # End-to-end Raw → Bronze → Silver → Gold
+dashboard/
+└── PSX_Risk_Dashboard.pbit        # Power BI template (full .pbix submitted separately)
+docs/
+└── PSX_Phase3_Final_Report.pdf    # Architecture, decision log, DAG analysis, FinOps
 ```
 
 ---
@@ -207,18 +308,29 @@ psx-risk-lakehouse/
 ### One-time setup
 
 1. Clone this repo into Databricks as a Git folder.
-2. Run `notebooks/00_setup` to create the `bronze`, `silver`, `ops` schemas, the volume and all tables.
-3. Upload raw files to `/Volumes/workspace/bronze/raw_landing/mkt_summary/{year}/{YYYY-MM-DD}.Z`.
+2. Run `notebooks/00_setup` to create the `bronze`, `silver`, `gold`, `ops` schemas, the volume and the Bronze/Silver/ops tables.
+3. Run `notebooks/03_gold/00_reference_data` once to create `ref_sector` and `ref_policy_rate` (Gold fact tables are created on the first Gold run).
+4. Upload raw files to `/Volumes/workspace/bronze/raw_landing/mkt_summary/{year}/{YYYY-MM-DD}.Z`.
 
-### Load types
+### Recommended: one end-to-end run
 
-Both runner notebooks take three widgets: `start_date`, `end_date`, `load_type`.
+`notebooks/04_pipeline/run_pipeline` takes three widgets (`start_date`, `end_date`, `load_type`) and runs Bronze → Silver → Gold in order, logging every step.
 
-| load_type | Bronze (`01_raw_to_bronze`) | Silver (`01_bronze_to_silver`) | Use it for |
+| Scenario | start_date | end_date | load_type |
 |---|---|---|---|
-| `full` | Loads every weekday file in the widget range | Processes the widget range | First load of the whole history |
-| `incremental` | Loads the widget range (normally just the new days) | **Ignores the widgets**: processes from the day after the last Silver date to the newest Bronze date | Daily runs |
-| `backfill` | Reloads the widget range, replacing those days | Reprocesses the widget range | Re-running a past period after a fix or a re-published file |
+| Daily incremental (new files uploaded) | first new day | last new day | `incremental` — Silver and Gold work out their own range |
+| Backfill an old period | e.g. `2020-03-02` | `2020-03-06` | `backfill` |
+| Full history | `2015-01-01` | latest day | `full` |
+
+### Layer-by-layer runners
+
+Each layer also has its own runner (`01_raw_to_bronze`, `01_bronze_to_silver`, `01_silver_to_gold`) with the same three widgets.
+
+| load_type | Bronze | Silver | Gold | Use it for |
+|---|---|---|---|---|
+| `full` | Loads every weekday file in the range | Processes the range | Rebuilds dims, MERGEs facts for the range | First load of the whole history |
+| `incremental` | Loads the given new days | From last Silver date + 1 to newest Bronze date | From last Gold date + 1 to newest Silver date | Daily runs |
+| `backfill` | Reloads the range, replacing those days | Reprocesses the range | Recomputes the range (with lookback windows) | Re-running a past period |
 
 ### Examples
 
@@ -251,6 +363,20 @@ ORDER BY start_time DESC;
 
 ---
 
+## Dashboard
+
+Power BI Desktop connects to the Databricks SQL Warehouse (Get Data → Databricks, server hostname + HTTP path, personal access token; Import mode). The model mirrors the star schema: `fact_daily_stock` and `fact_market_daily` → `dim_date` (many-to-one), `fact_daily_stock` → `dim_stock` (many-to-one); the ops tables are standalone audit tables.
+
+| Page | Answers | Visuals |
+|---|---|---|
+| Risk Overview | Q1 — which stocks/sectors are high-risk | KPI cards, volatility by sector, top-10 volatile stocks, year slicer |
+| Market Risk & Policy | Q2 systemic vs idiosyncratic, Q3 policy impact | Market volatility over time, SBP policy rate over time, market vs typical-stock volatility by year |
+| Pipeline Audit | Operations | Runs, failed runs, average duration, runs by layer/status, latest runs from the log |
+
+The template is in `dashboard/PSX_Risk_Dashboard.pbit` (opening it reconnects to Databricks and loads the data). The full `.pbix` with data is submitted separately because it exceeds GitHub's 25 MB web-upload limit.
+
+---
+
 ## Proof of execution
 
 The proof notebooks below were run in Databricks and their outputs are saved in the workspace. (Databricks Git folders do not commit notebook outputs, so the code is in this repository and the results are shown in the workspace and the submission.)
@@ -272,7 +398,9 @@ The proof notebooks below were run in Databricks and their outputs are saved in 
 
 - **Futures** (symbols containing `-`) are kept in Bronze but excluded from Silver.
 - **Missing open price:** some rows (e.g. on 1 Jan 2015) have no open price; these are kept with `open = NULL`.
-- **Sector codes** changed over time (e.g. mutual funds `8980` in 2015 vs `0806` later); Gold will map them to a single sector dimension.
+- **Sector codes** changed on 3 June 2015 (old 4-digit scheme → `0801`–`0839`); `dim_stock` uses each stock's latest code, and code `0839` (Apparel) appeared in 2026.
+- **Splits / bonus issues:** PSX adjusts LDCP on the ex-date (verified on LUCK's 5:1 split, 28 Apr 2025), so `ln(close/ldcp)` gives the true return.
+- **Right shares** (`…R1`) are excluded on the dashboard; excluding them in Gold is future work.
 - **Odd source days:** four weekdays returned a non-archive response from PSX during download and were retried.
 
 ---
@@ -288,7 +416,7 @@ The data contains **no personally identifiable information (PII)**: it is aggreg
 - **Processing:** PySpark on Databricks Free Edition (serverless)
 - **Storage:** Delta Lake, Unity Catalog volumes
 - **Extraction:** Python (`requests`) on Google Colab
-- **Visualization:** Power BI *(Phase 3)*
+- **Visualization:** Power BI Desktop (Databricks SQL Warehouse connector)
 - **Version control:** Git & GitHub (Databricks Git folder)
 
 ---
@@ -297,5 +425,13 @@ The data contains **no personally identifiable information (PII)**: it is aggreg
 
 - [x] **Phase 1** — Proposal, data source validation, sample payloads
 - [x] **Phase 2** — Bronze and Silver layers with full, incremental and backfill loads
-- [ ] **Phase 3** — Gold layer models and BI dashboard
+- [x] **Phase 3** — Gold star schema, end-to-end pipeline, Power BI dashboard, final report
 
+---
+
+## Team
+
+- Saqib — _role_
+- _Teammate name_ — _role_
+
+Course: Data Visualization and Analysis — FAST-NUCES Lahore
